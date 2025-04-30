@@ -1,0 +1,11 @@
+flask
+requests
+pandas
+numpy
+scikit-learn
+joblib
+langchain
+langchain-core
+langchain-openai
+langgraph
+polyline
