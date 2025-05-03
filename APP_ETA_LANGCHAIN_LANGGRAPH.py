@@ -8,13 +8,18 @@ import logging
 from flask import Flask, request, jsonify
 from datetime import datetime
 from sklearn.linear_model import LinearRegression
-from langchain.agents import Tool, AgentExecutor
+from langchain.agents import AgentExecutor
+from langchain_core.tools import Tool
+from langchain_core.tools import StructuredTool
 from langchain.agents import create_openai_functions_agent
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langchain_core.runnables import RunnableLambda
 from langchain_core.messages import SystemMessage 
+from typing import Optional
+from typing_extensions import Annotated
+from pydantic import BaseModel, Field
 import joblib
 from typing import TypedDict, Union
 
@@ -68,13 +73,13 @@ class ETACommand:
     def __init__(self, model):
         self.model = model
 
-    def execute(self, input_data, traffic=None):
-        if isinstance(input_data, dict):
-            query = input_data["input"]
-            order_picked_up = input_data.get("order_picked_up", False)
+    def execute(self, input: Union[str, dict], traffic: dict = None, order_picked_up: bool = False):
+        if isinstance(input, dict):
+            query = input["input"]
+            traffic = input.get("traffic", traffic)
+            order_picked_up = input.get("order_picked_up", order_picked_up)
         else:
-            query = input_data
-            order_picked_up = False
+            query = input
         
         lat1, lon1, lat2, lon2, lat3, lon3 = map(float, query.strip().split(","))
         now = datetime.now()
@@ -200,28 +205,54 @@ class ETAState(TypedDict):
 
 def setup_langgraph_agent(model):
     command = ETACommand(model)
-    tool = Tool(
-        name="ors_eta_predictor",
+    class ETAInput(BaseModel):
+        input: Annotated[str, Field(description="Coordinates string in the format 'driver_lat,driver_lng,restaurant_lat,restaurant_lng,customer_lat,customer_lng'")]
+        traffic: Optional[dict] = Field(default=None, description="Optional traffic data including trafficSpeedRatio")
+        order_picked_up: Optional[bool] = Field(default=False, description="Whether the order is already picked up")
+    
+    tool = StructuredTool.from_function(
         func=command.execute,
-        description="Input: 'driver_lat,driver_lng,restaurant_lat,restaurant_lng,customer_lat,customer_lng'. Output: JSON with summary and polyline.",
+        name="ors_eta_predictor",
+        description="Predicts hybrid ETA using ML and Google Maps based on coordinates and traffic.",
+        args_schema=ETAInput,
         return_direct=True
     )
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are an ETA prediction assistant. Use the ors_eta_predictor tool when coordinates are provided."),
-        ("human", "{input}"),
+        ("system", "You are an ETA prediction assistant. Always call the 'ors_eta_predictor' function when given input data."),
+        ("human", "Call ors_eta_predictor with the following: input='{input}', traffic={traffic}, order_picked_up={order_picked_up}"),
         MessagesPlaceholder(variable_name="agent_scratchpad")
     ])
     agent = create_openai_functions_agent(llm=llm, prompt=prompt, tools=[tool])
     executor = AgentExecutor(agent=agent, tools=[tool], verbose=False)
 
     def run(state):
-        result = command.execute(state)
+        agent_input = {
+            "input": state["input"],
+            "traffic": state.get("traffic"),
+            "order_picked_up": state.get("order_picked_up", False)
+        }
+    
+        agent_result = executor.invoke(agent_input)
+        print("=== Agent raw output ===", agent_result)
+    
+        # Unwrap StructuredTool result if needed
+        if isinstance(agent_result, dict):
+            output = agent_result.get("output", {})
+            if isinstance(output, dict) and "summary" in output:
+                return {
+                    "input": state["input"],
+                    "eta_result": output["summary"],
+                    "polyline": output.get("polyline", [])
+                }
+    
         return {
             "input": state["input"],
-            "eta_result": result.get("summary", "Unknown"),
-            "polyline": result.get("polyline", [])
+            "eta_result": "No result",
+            "polyline": []
         }
+    
+    
 
     def should_continue(state: ETAState) -> str:
         return "finish" if state["eta_result"] else "predict_eta"
